@@ -23,7 +23,6 @@
 - **进度监控**：完课后自动检查进度是否更新，未更新则警告提示
 - **调试模式**：开启 `debug` 可查看完整请求/响应日志
 - **无交互运行**：Docker / cron / 后台环境自动无交互，数据目录持久化
-- **低配兼容**：numpy 1.26 + OpenCV 4.10 锁定，兼容无 AVX2 的 QEMU 虚拟 CPU（便宜 1H1G 云服务器可跑）
 
 ## 使用
 
@@ -35,13 +34,13 @@
 
 点这里打开最新版下载页 → [**Releases**](https://github.com/hangone/WeBan/releases/latest)，按自己的电脑系统下载（不确定系统就按下面的表选）：
 
-| 你的电脑                             | 点击下载（GitHub）                                                                                       | 下载太慢用镜像                                                                                               |
-| ------------------------------------ | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| Windows（绝大多数电脑）              | [WeBan-windows-x64.exe](https://github.com/hangone/WeBan/releases/latest/download/WeBan-windows-x64.exe) | [镜像](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-windows-x64.exe) |
-| Mac 苹果电脑（Intel 芯片）           | [WeBan-macos-x64](https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-x64)             | [镜像](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-x64)       |
-| Mac 苹果电脑（M1/M2/M3/M4 芯片）     | [WeBan-macos-arm64](https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-arm64)         | [镜像](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-arm64)     |
-| Linux（Ubuntu/Debian/CentOS，64 位） | [WeBan-linux-x64](https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-x64)             | [镜像](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-x64)       |
-| Linux（树莓派/ARM 服务器）           | [WeBan-linux-arm64](https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-arm64)         | [镜像](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-arm64)     |
+| 你的电脑                             | 点击下载（GitHub）                                                                                       | 下载太慢用镜像                                                                                                                               |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Windows（绝大多数电脑）              | [WeBan-windows-x64.exe](https://github.com/hangone/WeBan/releases/latest/download/WeBan-windows-x64.exe) | [镜像](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-windows-x64.exe) [备用](https://ghfast.top/https://github.com/hangone/WeBan/releases/latest/download/WeBan-windows-x64.exe) |
+| Mac 苹果电脑（Intel 芯片）           | [WeBan-macos-x64](https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-x64)             | [镜像](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-x64) [备用](https://ghfast.top/https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-x64)             |
+| Mac 苹果电脑（M1/M2/M3/M4 芯片）     | [WeBan-macos-arm64](https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-arm64)         | [镜像](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-arm64) [备用](https://ghfast.top/https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-arm64)         |
+| Linux（Ubuntu/Debian/CentOS，64 位） | [WeBan-linux-x64](https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-x64)             | [镜像](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-x64) [备用](https://ghfast.top/https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-x64)             |
+| Linux（树莓派/ARM 服务器）           | [WeBan-linux-arm64](https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-arm64)         | [镜像](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-arm64) [备用](https://ghfast.top/https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-arm64)         |
 
 > **Mac 怎么判断芯片**：屏幕左上角 → 关于本机，看"芯片"一栏写的是 Apple M 系列（arm64）还是 Intel（x64）。Windows 不确定就选 x64（2010 年后几乎都是）。
 
@@ -101,7 +100,7 @@ WB_TENANT_NAME="你的学校全称" WB_USERNAME=你的学号 WB_PASSWORD=你的�
 | `exam_mode`              | `--exam-mode`                | `WB_EXAM_MODE`              | 考试模式（`false`/`true`/`perfect`/`force`）                                       |
 | `random_answer`          | `--random-answer`            | `WB_RANDOM_ANSWER`          | 题库外题目是否随机作答（`true`/`false`）                                           |
 | `study_time`             | `--study-time SEC`           | `WB_STUDY_TIME`             | 每门课学习时长 `"基础,随机上限"`（秒），如 `"20,5"`                                |
-| `video_speed`            | `--video-speed N`            | `WB_VIDEO_SPEED`            | 视频课程倍速：`0`=不按视频时长等待、`1`=原速、`2`=半速                             |
+| `video_speed`            | `--video-speed N`            | `WB_VIDEO_SPEED`            | 视频课程倍速：`0`=不按视频时长等待、`1`=原速、`2`=半速（默认）                       |
 | `exam_question_time`     | `--exam-question-time SEC`   | `WB_EXAM_QUESTION_TIME`     | 每道考试题答题等待时长 `"基础,随机上限"`（秒）                                     |
 | `exam_submit_match_rate` | `--exam-submit-match-rate N` | `WB_EXAM_SUBMIT_MATCH_RATE` | 允许交卷的最低题库匹配率（百分比）                                                 |
 | `exam_ui`                | `--exam-ui`                  | `WB_EXAM_UI`                | 是否启用交互式答题与核对页面（`true`/`false`，桌面端默认 `true`，绝不自动交卷）    |
@@ -122,6 +121,7 @@ WB_TENANT_NAME="你的学校全称" WB_USERNAME=你的学号 WB_PASSWORD=你的�
 | `[ai].base_url`          | `--ai-base-url URL`          | `WB_AI_BASE_URL`            | AI 服务 API 基础路径                                                               |
 | `[ai].api_key`           | `--ai-api-key KEY`           | `WB_AI_API_KEY`             | AI 服务 API Key                                                                    |
 | `[ai].model`             | `--ai-model NAME`            | `WB_AI_MODEL`               | AI 模型名称                                                                        |
+| `[ai].api_mode`          | `--ai-api-mode MODE`         | `WB_AI_API_MODE`            | AI 接口协议（`auto`/`responses`/`chat`，默认 `auto`）                              |
 | `[ai].timeout`             | `--ai-timeout SEC`             | `WB_AI_TIMEOUT`             | AI 请求超时秒数                                                                    |
 | `[ai].max_retries`         | `--ai-max-retries N`           | `WB_AI_MAX_RETRIES`         | AI 请求失败最大重试次数                                                            |
 | `[ai].reasoning_effort`    | `--ai-reasoning-effort LEVEL`  | `WB_AI_REASONING_EFFORT`    | AI 思考强度（OpenAI 标准 `reasoning_effort`，如 `none`/`low`/`medium`/`high`/`xhigh`） |
@@ -152,7 +152,7 @@ WB_STUDY_TIME="20,5" WB_VIDEO_SPEED=0 ./WeBan-macos-arm64
 - **自动执行**：自动标记本地题库命中题，并顺序对未命中题发起 AI 搜题，在右侧面板实时流式显示 AI 思考过程、参考文档来源与作答理由。
 - **键鼠双控 + 随时人工纠正**：可在自动答题期间随时暂停、切题、修改选项或切换思考强度重新让 AI 思考；**人工修改过的题目绝不会被后台自动引擎覆盖**。
 - **绝不自动交卷**：所有题目作答完成后会停留在“等待人工核对”状态，只有人工点击「提交试卷」（或 `Ctrl+Enter`）并通过二次确认弹窗后才会调用交卷接口；也可以点击「放弃交卷」安全退出（不消耗考试次数）。
-- **免登录实测**：运行 `uv run main.py --exam-ui-demo` 将直接调用你在 `config.toml` / 环境变量 / CLI 中配置的真实模型 API 与 `knowledge/` 知识库，并在界面实时显示接入的模型与接口、TTFT、TPS、上下文长度、累计 Token（含缓存命中）与 Agent 工具检索轨迹；追加 `--mock` 可切换为离线模拟模式。
+- **免登录实测**：运行 `uv run weban --exam-ui-demo` 将直接调用你在 `config.toml` / 环境变量 / CLI 中配置的真实模型 API 与 `knowledge/` 知识库，并在界面实时显示接入的模型与接口、TTFT、TPS、上下文长度、累计 Token（含缓存命中）与 Agent 工具检索轨迹；追加 `--mock` 可切换为离线模拟模式。
 
 常用快捷键：
 `←`/`→` 或 `K`/`J` 切题 · `1`-`9` / `A`-`I` 选答案 · `N` 跳下一待核对题 · `V` 标记已核对 · `F` 标星存疑 · `P` 暂停/继续自动答题 · `R` 重跑 AI · `G` 跟随当前执行题 · `Ctrl+Enter` 打开手动提交确认 · `?` 查看帮助。
@@ -170,29 +170,30 @@ WB_STUDY_TIME="20,5" WB_VIDEO_SPEED=0 ./WeBan-macos-arm64
 
 ### 源码运行
 
-不需要代码基础的用户**跳过本节**（直接下载二进制即可）。开发者/想改代码时用：
+不需要代码基础的用户跳过本节，直接下载二进制即可。开发者或想改代码时用：
 
-1. 安装 Python 3（建议使用 [uv](https://github.com/astral-sh/uv)）和 Git
+1. 安装 [uv](https://github.com/astral-sh/uv) 和 Git。项目需要 Python 3.14，uv 会按 `.python-version` 自动装好。
 
-2. 克隆本仓库
+2. 克隆仓库并进入目录
 
 ```bash
 git clone --depth 1 https://github.com/NoobCock/WeBan
+cd WeBan
 ```
 
 3. 安装依赖
 
 ```bash
-pip install -r requirements.txt # 或 uv sync
+uv sync
 ```
 
 4. 运行
 
 ```bash
-python main.py # 或 uv run main.py
+uv run weban
 ```
 
-运行 `python main.py --help` 可查看全部参数。
+`uv run weban --help` 可查看全部参数。
 
 ### Docker
 
@@ -282,8 +283,86 @@ docker run --rm \
 3. **Playwright 浏览器**：自动查找 `~/.cache/ms-playwright` 下的 Chromium
 4. **系统浏览器**：自动查找已安装的 Chrome / Chromium / Edge
 
-## 演示
+## 油猴脚本（浏览器版）
 
+[`weban.user.js`](weban.user.js) 在浏览器里完成整套流程，**不需要 Python 环境**：自动学完未完成课程、自动处理交互题、自动答题、自动交卷。
+
+**安装**：Tampermonkey → 新建脚本 → 粘贴 `weban.user.js` → 先在官网登录 → 打开 <https://weiban.mycourse.cn/> → 面板点「开始」。
+
+### 解决的实际问题
+
+| 痛点 | 做法 |
+| --- | --- |
+| 动画太慢 | CSS `animation`/`transition` 压到 0.05s，长 `setTimeout` 按比例压缩 |
+| 点击有声音 | **默认静音**：覆盖 audio/video 并拦截 `HTMLMediaElement.play()`，动态插入的媒体也处理 |
+| 手动点翻页 | 自动翻到底，再触达完课按钮 |
+| 交互题要手点 | 逐选项「点一个 → 提交 → 等复位 → 下一个」，走完页面才放行 |
+| 考试手答 | 从 `server.py` 查题库，按答案文本匹配选项 |
+
+### 控制面板
+
+- **学习**：翻页间隔、动画加速开关、静音开关
+- **考试**：答题间隔、题库外随机作答
+- **辅助服务**：题库/验证码服务地址与 Token
+- **日志**：实时滚动、可清空、可复制；顶部进度条显示当前第几门课
+
+### 实测记录（真实课程 A11078，16 页）
+
+- 15 页全流程 **19.8 秒**走完，`pageNums=9`，满足完课条件
+- 3 个 `audio` 元素全部 `muted`，动画 `0.05s` 生效
+- 交互题 5 个选项逐个点击 + 提交，全部变 `-1.png`，成功放出下一页
+
+### 原理
+
+主站是 Vue + Vuex 应用，接口都封装在 store actions 里。脚本用 `#app.__vue__` 拿根实例后直接 `dispatch` 官方 action，签名、加密、token 全交给页面。课程页则由脚本真实点击按钮驱动，完课请求由页面自己的 `finishWxCourse()` 发出。源码见 `src/online-*/ `（sourcemap 还原）。
+
+### 课程结构适配（52 门实测）
+
+平台课程页面差异极大，实测 52 门课至少 8 种完课方式。脚本不做逐课适配，而是用**通用状态机**：
+
+| 类型 | 数量 | 处理方式 |
+| --- | --- | --- |
+| 标准翻页 + `btn-next-end` | 7 门 | 翻到底点完课按钮 |
+| 翻页 + `btn-at` 选择题 | 4 门 | 从 `item.js` 的 `slFn()` 读答案勾选 |
+| `apicenext` 轨迹上报 | 2 门 | 页面自己上报，脚本只管翻页 |
+| 纯视频课 | 7 门 | 等播放结束，页面自动完课 |
+| 混合型 | 32 门 | 按页面实际出现的元素逐项处理 |
+
+通用机制覆盖率：`finishWxCourse` **49/52**（其余 3 门是视频课，由播放器回调触发）。
+
+**前进按钮**共识别 12 种：`btn-start`、`btn-ce`、`btn-at`、`btn-next`、`page-next-btn`、`answer-btn-next`、`btn-ti`、`page-success-button2`、`pN_next` 等，另有兜底匹配。
+
+### 已知限制
+
+- **视频课不做倍速破解**：官方播放器 `playbackRates` 上限 2 倍，需在播放器菜单手动选；脚本只等它播完
+- 页面报错会 `alert`（如重复完课提示"发送完成失败"），脚本已拦截并转为日志，不会卡死
+- 已完成课程重复学习时，服务端会拒绝完课，脚本会提示但不算成功
+
+## 辅助服务 weban.server
+
+[`weban/server.py`](weban/server.py) 提供**题库查询**和**验证码识别**，脚本不配也能跑，题库外的题随机、验证码要手点。
+
+```bash
+uv run python -m weban.server                          # 127.0.0.1:8765，无鉴权
+WB_TOKEN=随机串 uv run python -m weban.server            # 开鉴权
+uv run python -m weban.server --host 0.0.0.0 --token 随机串   # 对外，必须带 token
+```
+
+| 接口 | 作用 |
+| --- | --- |
+| `POST /answer/query` | 传 `{title, options}`，返回 `{hit, indexes, answers, matchedBy}` |
+| `POST /answer/match` | 一次传多题，返回每题结果 |
+| `POST /captcha/point` | 点选验证码 → 3 个坐标 |
+| `POST /captcha/text` | 登录验证码 → 4 位字符 |
+| `GET /answer/stats` / `GET /health` | 题库统计 / 健康检查 |
+
+题库来自 `answer/answer.json`（3700+ 题），文件改动后自动重载。题目文本会做规范化（去空格标点、全角转半角、小写），所以「带空格或标点不同」的同一道题也能命中。
+
+在脚本面板「辅助服务地址」里填 `http://127.0.0.1:8765` 即可。
+
+安全约束：默认只监听回环地址；对外必须带 token；图片地址限制 https + 域名白名单 + DNS 内网校验（防 SSRF）；请求体与图片都有大小上限；按 IP 限流。
+
+## 演示
 ![study](images/study.png)
 ![exam](images/exam.png)
 ![old](images/old.png)
@@ -293,6 +372,8 @@ docker run --rm \
 - ### 浏览器检测失败 / 启动失败
 
 关闭代理软件的系统代理再试，或把 `127.0.0.1`、`localhost` 加入代理软件的 bypass 列表。
+
+Chrome 自动更新后首次启动需要额外加载与签名校验，健康检查默认等 30 秒；机器更慢时用 `WB_BROWSER_START_TIMEOUT`（秒）放宽。
 
 - ### 部分无法直接登录的学校/Token 登录方法
 
@@ -307,6 +388,7 @@ docker run --rm \
 2. 课程点选验证码会自动识别（无头浏览器 + OpenCV，最多 2 轮 × 3 次，可用 WB_CAPTCHA_ROUNDS/WB_CAPTCHA_ATTEMPTS 调整），失败后在交互模式会打开浏览器手动操作，无交互模式（Docker 等）会跳过该课程并告警
 3. 账号锁定后，请等待1小时再按原方式登录
 4. 有新手引导时，先在官网完成
+5. 单课完课失败会跳过本门并继续后续课程，不自动重发完课请求。未完成课程下次运行会重新学习。账号锁定或登录失效仍停止当前账号，是否完成以平台进度为准。
 
 - ### 考试
 

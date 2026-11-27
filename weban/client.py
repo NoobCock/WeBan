@@ -1,8 +1,6 @@
 import json
 import os
 import re
-import sys
-import threading
 import time
 import webbrowser
 from random import randint
@@ -12,35 +10,34 @@ from uuid import uuid4
 
 from loguru import logger
 
-from ai_client import (
+from weban.ai_client import (
     extract_endpoint_host,
     parse_ai_response,
     parse_bool,
     request_ai_answer,
     solve_question_with_ai,
 )
-from api import WeBanAPI
-from captcha import CaptchaHandler, LoginCaptchaSolver, is_non_interactive
-from exam_ui import ExamSessionController, run_interactive_exam_ui
-
-if getattr(sys, "frozen", False):
-    base_path = os.path.dirname(os.path.abspath(sys.executable))
-    bundle_path = sys._MEIPASS  # type: ignore[attr-defined]
-else:
-    base_path = os.path.dirname(os.path.abspath(__file__))
-    bundle_path = base_path
+from weban.api import AccountBlockedError, WeBanAPI
+from weban.captcha import CaptchaHandler, LoginCaptchaSolver, is_non_interactive
+from weban.exam_ui import ExamSessionController, run_interactive_exam_ui
+from weban.utils import (
+    ANSWER_DIR,
+    ANSWER_PATH,
+    APP_DIR,
+    BASE_DIR,
+    BUNDLE_ANSWER_PATH,
+    DATA_DIR,
+    LOGS_DIR,
+    ROOT_ANSWER_PATH,
+    USED_FALLBACK,
+    ask,
+)
 
 # 无交互模式判定复用 captcha.is_non_interactive（ENVIRONMENT=docker / stdin 非 TTY）
 
-# 数据目录模式（main.py --data-dir / WB_DATA_DIR）：answer 也放数据目录，便于挂载持久化
-_data_dir = os.environ.get("WB_DATA_DIR", "")
-if _data_dir:
-    answer_dir = os.path.join(_data_dir, "answer")
-else:
-    answer_dir = os.path.join(base_path, "answer")
-answer_path = os.path.join(answer_dir, "answer.json")
-root_answer_path = os.path.join(_data_dir, "answer.json") if _data_dir else os.path.join(base_path, "answer.json")
-bundle_answer_path = os.path.join(bundle_path, "answer", "answer.json")
+
+class AnswerBankError(RuntimeError):
+    """本地与远程题库均不可用（文件不可读或内容无效）。"""
 
 
 def clean_text(text):
@@ -87,6 +84,31 @@ def read_first_existing(paths: list[str]) -> str | None:
         except OSError:
             continue
     return None
+
+
+def read_text_with_retry(path: str, attempts: int = 3) -> str:
+    """读取文本文件，遇到 PermissionError 时按间隔重试。
+
+    Windows 上文件被其他进程扫描时，open 会报 PermissionError（共享冲突
+    同样是 errno 13），扫描结束后可读。文件不存在直接抛出。
+
+    :param path: 文件路径
+    :param attempts: 最大尝试次数
+    :return: 文件文本
+    :raises OSError: 重试后仍不可读，或文件不存在
+    """
+    delays = (0.2, 0.5, 1.0)
+    for attempt in range(attempts):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            raise
+        except OSError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delays[min(attempt, len(delays) - 1)])
+    raise AssertionError("unreachable")
 
 
 def _check_code_ok(data: dict, allow_200: bool = True) -> bool:
@@ -227,7 +249,7 @@ def _expand_course_pages(html: str, script: str) -> str:
         fragment = template.group(2)
         if not re.search(r"<section\b[^>]*\bpage-item\b[^>]*\bpage-\$\{", fragment):
             continue  # 课后题 page-aq 等模板由题目分支处理。
-        error = "无法解析动态内容页，已停止学习，请在官网完成该课程"
+        error = "无法解析动态内容页，跳过本门课程，请在官网完成该课程"
         loops = [
             match for match in re.finditer(r"\bfor\s*\(([^)]*)\)\s*\{", script)
             if match.end() <= template.start() < _js_block_end(script, match.end())
@@ -701,7 +723,7 @@ def _question_trace_flow(html: str, script: str) -> tuple[int, int]:
             return per_question, after
         if reached:
             after += int(any("btn-next" in item for item in _class_lists(section.group(2))))
-    raise RuntimeError("题目返回正文后的轨迹路径无法完整解析，已停止学习")
+    raise RuntimeError("题目返回正文后的轨迹路径无法完整解析，跳过本门课程")
 
 
 def _course_completion_timing(script: str, has_questions: bool | None = None) -> tuple[bool, float] | None:
@@ -800,7 +822,7 @@ def _count_nav_pages(html: str) -> tuple[int, int]:
 
 
 def _fetch_text(session, url: str, referer: str | None = None) -> str:
-    """读取计算课程路径所必需的 HTML/JS，失败时停止，不能按缺失脚本完课。
+    """读取计算课程路径所必需的 HTML/JS，失败时抛出，跳过本门课程。
     :param session: LoggingSession 实例
     :param url: 目标 URL
     :param referer: 自定义 Referer（抓 mcwk 资源时应传课程播放页 URL，
@@ -812,10 +834,95 @@ def _fetch_text(session, url: str, referer: str | None = None) -> str:
         headers["Referer"] = referer
     resp = session.get(url, timeout=10, headers=headers)
     if resp.status_code == 701:
-        raise PermissionError("课程资源请求被限制，已停止学习")
+        raise AccountBlockedError("课程资源请求被限制，已停止当前账号")
     if resp.status_code != 200 or not resp.text.strip():
-        raise RuntimeError(f"课程资源读取失败（HTTP {resp.status_code}），已停止学习")
+        raise RuntimeError(f"课程资源读取失败（HTTP {resp.status_code}），跳过本门课程")
     return resp.text
+
+
+def _fetch_video_duration(session, video_url: str) -> float:
+    """读取单个视频地址的时长（秒），取不到返回 0.0。
+
+    m3u8 累加 EXTINF；mp4 按 box 长度逐段跳转定位 mvhd（moov 可能在
+    mdat 之后）。网络异常（含 CDN 证书过期）按取不到处理，由调用方
+    切换备用镜像，不能中断整个账号。
+    """
+    video_duration = 0.0
+    try:
+        if urlparse(video_url).path.endswith(".m3u8"):
+            # m3u8：累加 EXTINF 时长
+            playlist = session.get(video_url, timeout=10)
+            if playlist.status_code == 200:
+                segments = re.findall(
+                    r"#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)",
+                    playlist.text,
+                )
+                if not segments:
+                    variant = re.search(
+                        r"#EXT-X-STREAM-INF:[^\n]*\n\s*(\S+)",
+                        playlist.text,
+                    )
+                    if variant:
+                        playlist = session.get(
+                            urljoin(video_url, variant.group(1)),
+                            timeout=10,
+                        )
+                        if playlist.status_code == 200:
+                            segments = re.findall(
+                                r"#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)",
+                                playlist.text,
+                            )
+                video_duration = sum(float(s) for s in segments)
+        else:
+            # moov 可能在 mdat 后，按 box 长度跳转定位。
+            offset = 0
+            movie_end = None
+            full_content = None
+            for _ in range(128):
+                if full_content is None:
+                    metadata = session.get(
+                        video_url,
+                        headers={"Range": f"bytes={offset}-{offset + 63}"},
+                        timeout=10,
+                    )
+                    if metadata.status_code not in (200, 206):
+                        break
+                    if metadata.status_code == 200:
+                        full_content = metadata.content
+                    buf = metadata.content if full_content is None else full_content[offset:offset + 64]
+                else:
+                    buf = full_content[offset:offset + 64]
+                if len(buf) < 8:
+                    break
+                size = int.from_bytes(buf[:4], "big")
+                kind = buf[4:8]
+                header = 16 if size == 1 else 8
+                if size == 1:
+                    size = int.from_bytes(buf[8:16], "big")
+                if size < header:
+                    break
+                if kind == b"moov":
+                    movie_end = offset + size
+                    offset += header
+                    continue
+                if kind == b"mvhd" and movie_end is not None:
+                    version = buf[header]
+                    scale_pos = header + (20 if version == 1 else 12)
+                    duration_pos = scale_pos + 4
+                    duration_size = 8 if version == 1 else 4
+                    if version not in (0, 1) or len(buf) < duration_pos + duration_size:
+                        break
+                    timescale = int.from_bytes(buf[scale_pos:duration_pos], "big")
+                    duration = int.from_bytes(buf[duration_pos:duration_pos + duration_size], "big")
+                    if timescale:
+                        video_duration = duration / timescale
+                    break
+                offset += size
+                if movie_end is not None and offset >= movie_end:
+                    break
+    except OSError:
+        return 0.0
+    return video_duration
 
 
 # ---------------------------------------------------------------------------
@@ -824,8 +931,6 @@ def _fetch_text(session, url: str, referer: str | None = None) -> str:
 
 
 class WeBanClient:
-    _stdin_lock = threading.Lock()
-
     def __init__(
         self,
         tenant_name: str,
@@ -838,7 +943,7 @@ class WeBanClient:
         cdp_port: int | None = None,
         debug: bool = False,
         ai_config: dict[str, Any] | None = None,
-        video_speed: float = 1.0,
+        video_speed: float = 2.0,
         jupiter_fallback: bool = False,
         data_dir: str | None = None,
         exam_ui: bool = False,
@@ -856,7 +961,7 @@ class WeBanClient:
         :param debug: 是否启用调试日志
         :param ai_config: AI 搜题配置
         :param video_speed: 视频课程学习倍速，完课前按 视频时长/倍速 等待；
-            0 表示不按视频时长等待，只按 study_time 学习时长
+            2 表示按半速等待，0 表示不按视频时长等待，只按 study_time 学习时长
         :param jupiter_fallback: 对未加载 apicenext.js 的课程也补发 jupiter
             翻页轨迹。官方页面只有加载 apicenext.js（定义全局 uuid 并调用
             callApinext）的课程才上报轨迹，默认 False 完全对齐官方行为；
@@ -878,7 +983,7 @@ class WeBanClient:
         self.cdp_host = cdp_host
         self.cdp_port = cdp_port
         self.ai_config = ai_config
-        self.data_dir = data_dir or _data_dir or None
+        self.data_dir = data_dir or DATA_DIR or (APP_DIR if USED_FALLBACK else None)
         self.exam_ui = bool(exam_ui)
         self.exam_ui_port = int(exam_ui_port or 0)
         self._ai_key_warned = False  # api_key 未配置提醒只打一次
@@ -1007,43 +1112,52 @@ class WeBanClient:
             self.log.debug(f"问卷列表请求失败（网络异常）：{e}")
 
     def _prompt(self, message: str) -> str:
-        """线程安全的 input 封装，多线程下避免 input 输出交错
+        """读取一行输入，提示显示期间日志缓冲
         :param message: 提示信息
         :return: 去除首尾空白的用户输入
         """
-        with self._stdin_lock:
-            return input(message).strip()
+        return ask(message).strip()
+
+    @staticmethod
+    def _parse_answers(text: str) -> dict:
+        """解析题库 JSON 为 {clean_text(题目): {clean_text(正确选项), ...}}"""
+        answers: dict = {}
+        for title, options in json.loads(text).items():
+            title = clean_text(title)
+            answers.setdefault(title, set()).update(
+                clean_text(a["content"])
+                for a in options.get("optionList", [])
+                if a["isCorrect"] == 1
+            )
+        return answers
 
     def _load_answers_json(self, warn_on_fail: bool = False) -> dict:
         """加载题库，返回 {clean_text(题目): {clean_text(正确选项), ...}}
 
-        :param warn_on_fail: True 时加载失败只警告不抛异常（学习模式容错），
-            False 时抛出异常（考试模式必须要有题库）
+        按 根目录 answer.json > answer/answer.json > 打包内置 的顺序尝试，
+        单次读取对瞬时文件锁重试；某个来源不可读或格式错误时继续尝试下一个。
+
+        :param warn_on_fail: True 时加载失败记录警告并返回空题库（学习模式），
+            False 时抛 AnswerBankError（考试模式）
         :return: 清洗后的题目标题 → 正确答案内容集合的映射
+        :raises AnswerBankError: 所有来源均不可用，且 warn_on_fail 为 False
         """
-        answers: dict = {}
-        # 优先级: 根目录 answer.json > answer/answer.json > 打包内置
-        if os.path.exists(root_answer_path):
-            load_path = root_answer_path
-        elif os.path.exists(answer_path):
-            load_path = answer_path
-        else:
-            load_path = bundle_answer_path
-        try:
-            with open(load_path, encoding="utf-8") as f:
-                for title, options in json.load(f).items():
-                    title = clean_text(title)
-                    answers.setdefault(title, set()).update(
-                        clean_text(a["content"])
-                        for a in options.get("optionList", [])
-                        if a["isCorrect"] == 1
-                    )
-        except Exception:
-            if warn_on_fail:
-                self.log.warning("题库加载失败，课后习题将随机作答")
-            else:
-                raise
-        return answers
+        candidates = [
+            p
+            for p in (ROOT_ANSWER_PATH, ANSWER_PATH, BUNDLE_ANSWER_PATH)
+            if os.path.exists(p)
+        ] or [BUNDLE_ANSWER_PATH]
+        errors: list[str] = []
+        for load_path in candidates:
+            try:
+                return self._parse_answers(read_text_with_retry(load_path))
+            except Exception as e:  # noqa: BLE001 -- 单个来源失败继续尝试下一个
+                errors.append(f"{load_path}: {e}")
+        reason = "；".join(errors)
+        if warn_on_fail:
+            self.log.warning(f"题库加载失败（{reason}），课后习题将随机作答")
+            return {}
+        raise AnswerBankError(f"题库不可用（{reason}）")
 
     @staticmethod
     def get_project_type(project_category: int) -> str:
@@ -1240,7 +1354,7 @@ class WeBanClient:
                 account_id = (
                     self.api.account or self.api.user.get("userId") or "unknown"
                 )
-                captcha_dir = os.path.join(base_path, "logs", account_id)
+                captcha_dir = os.path.join(LOGS_DIR, account_id)
                 os.makedirs(captcha_dir, exist_ok=True)
                 captcha_path = os.path.join(captcha_dir, "verify_code.png")
                 with open(captcha_path, "wb") as f:
@@ -1475,17 +1589,16 @@ class WeBanClient:
                     for course in courses.get("data", []):
                         if not force_restudy and int(course.get("finished", 0)) == 1:
                             continue
-                        if not self._learn_course(
+                        self._learn_course(
                             course,
                             task,
                             category_prefix,
                             project_prefix,
                             answers_json,
                             force_restudy,
-                        ):
-                            return
+                        )
 
-            self.log.success(f"{project_prefix} 课程学习完成")
+            self.log.info(f"{project_prefix} 课程处理结束")
             self._check_project_course_done(task, project_prefix)
 
     def _check_project_course_done(
@@ -1524,11 +1637,8 @@ class WeBanClient:
         project_prefix: str,
         answers_json: dict,
         force_restudy: bool,
-    ) -> bool:
-        """学习单门课程并校验进度是否更新（折叠/扁平两条列表路径共用）。
-
-        :return: True 可继续下一门；False 表示账号异常/锁定，应停止本账号
-        """
+    ) -> None:
+        """学习单门课程，失败时跳过；账号限制异常向上传递。"""
         course_prefix = f"{category_prefix}/{course['resourceName']}"
         try:
             progress_before = self.get_progress(
@@ -1538,16 +1648,29 @@ class WeBanClient:
             if progress_before.get("code", -1) == "0":
                 d = progress_before["data"]
                 finished_before = sum(d[done] for _, _, _, done in COURSE_CATEGORIES)
-            ok = self._study_one_course(
+        except PermissionError:
+            raise  # Token 失效，立即终止该账号
+        except OSError as e:
+            self.log.warning(f"{course_prefix}：网络异常，跳过本门课程（{e}）")
+            return
+        try:
+            if not self._study_one_course(
                 course,
                 task,
                 category_prefix,
                 project_prefix,
                 answers_json,
                 force_restudy,
-            )
-            if not ok:
-                raise PermissionError("检测到行为异常或账号锁定，已停止当前账号")
+            ):
+                return
+        except PermissionError:
+            raise  # Token 失效、账号受限，立即终止该账号
+        except Exception as e:  # noqa: BLE001 -- 课程级异常只跳过本门课程
+            # 轨迹、资源、题目解析等课程级异常只跳过本门课程，未完成的
+            # 课程下次运行会自动重学；网络异常同理。
+            self.log.warning(f"{course_prefix}：本门课程失败，跳过（{e}）")
+            return
+        try:
             progress_after = self.get_progress(task["userProjectId"], project_prefix)
             if progress_after.get("code", -1) == "0":
                 d = progress_after["data"]
@@ -1563,10 +1686,7 @@ class WeBanClient:
         except PermissionError:
             raise  # Token 失效，立即终止该账号
         except OSError as e:
-            # 网络异常（DNS/连接/SSL）跳过本门课程，不中断整个账号；
-            # 未完成的课程下次运行会自动重学
             self.log.warning(f"{course_prefix}：网络异常，跳过本门课程（{e}）")
-        return True
 
     def _study_flat_courses(
         self,
@@ -1623,27 +1743,14 @@ class WeBanClient:
                 continue
             category_name = course.get("categoryName") or label
             category_prefix = f"{label} {project_prefix}/{category_name}"
-            if not self._learn_course(
+            self._learn_course(
                 course,
                 task,
                 category_prefix,
                 project_prefix,
                 answers_json,
                 force_restudy,
-            ):
-                return
-
-    @staticmethod
-    def _is_account_blocked(res: dict) -> bool:
-        """完课/接口返回是否表示行为异常或账号锁定，应立即停跑。"""
-        if not res:
-            return False
-        detail = str(res.get("detailCode", ""))
-        msg = str(res.get("msg", ""))
-        raw = str(res.get("raw", ""))
-        if detail in {"10018", "701"}:
-            return True
-        return ("行为存在异常" in msg or "Account locked" in raw or "Account locked" in msg)
+            )
 
     def _study_one_course(
         self,
@@ -1658,7 +1765,7 @@ class WeBanClient:
 无 apicenext 的默认只答题+完课（对齐官方页面行为），配置
 jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
 
-        :return: True 可继续下一门；False 表示账号异常/锁定，应停止本账号
+        :return: True 表示课程已完成；False 表示失败或跳过
         """
         course_prefix = f"{category_prefix}/{course['resourceName']}"
 
@@ -1672,7 +1779,7 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
         if not _check_code_ok(study_res):
             msg = study_res.get("message") or study_res.get("msg") or "课程暂时无法学习"
             self.log.warning(f"{course_prefix}：{msg}，跳过")
-            return True
+            return False
         study_start = time.time()
 
         # 官方 H5 完课不依赖列表对象的 userCourseId：课程页 URL 由
@@ -1693,7 +1800,7 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
                 course["userCourseId"] = uid[0]
             else:
                 self.log.warning(f"{course_prefix}：未获取到学习记录（userCourseId 为空），跳过")
-                return True
+                return False
 
         course_code = ""
         url_path = urlparse(course_url).path
@@ -1714,6 +1821,17 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
             }
         )
 
+        # 视频时长只在 video_speed>0 时用于对齐等待；所有 CDN 都取不到时
+        # 跳过本门课程，避免按 study_time 完课与实际视频长度不符，也不能
+        # 因一门课的时长读不到中断整个账号（其他课程下次仍会重试）。
+        if (
+            self.video_speed > 0
+            and item_info.get("has_video")
+            and not item_info.get("video_duration")
+        ):
+            self.log.warning(f"{course_prefix}：视频时长未知，跳过本门课程")
+            return False
+
         nonstr_map = item_info.get("nonstr_map", {})
         total_step = item_info.get("total_step", 0)
         total_step_source = item_info.get("total_step_source", "")
@@ -1732,7 +1850,7 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
         branch = "with_questions" if questions.get("examQuestionList") else "without_questions"
         steps = dynamic_steps.get(branch)
         if uses_apinext and "dynamic_steps" in item_info and not steps:
-            raise RuntimeError("课程轨迹路径未能完整解析，已停止学习，不使用页数推测")
+            raise RuntimeError("课程轨迹路径未能完整解析，跳过本门课程，不使用页数推测")
         finish_step = None
         question_trace, after_question_trace = item_info.get("question_trace_flow", (0, 0))
         if steps:
@@ -1765,7 +1883,7 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
 
         completion_timing = (item_info.get("completion_timings") or {}).get(branch) or item_info.get("completion_timing")
         if trace_enabled and "completion_timing" in item_info and completion_timing is None:
-            raise RuntimeError("课程完课顺序未能完整解析，已停止学习")
+            raise RuntimeError("课程完课顺序未能完整解析，跳过本门课程")
         exam_questions = questions.get("examQuestionList", [])
         deferred_steps = len(exam_questions) * question_trace + after_question_trace if exam_questions else 0
         if total_step and trace_enabled:
@@ -1849,7 +1967,8 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
         if finish_first:
             res = self._finish_course(course, task, query, course_url, unique_no)
             if not _check_code_ok(res, allow_200=False):
-                raise RuntimeError(f"{course_prefix} 完成失败，已停止学习：{res}")
+                self.log.error(f"{course_prefix} 完成失败，本次跳过并继续后续课程：{res}")
+                return False
         if total_step and trace_enabled:
             send_trace(total_step, finish=1)
         if item_info.get("trace_after_finish") and total_step and trace_enabled:
@@ -1861,7 +1980,8 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
             res = self._finish_course(course, task, query, course_url, unique_no)
         # 完课走 JSONP（sdk.js finishWxCourse）：checkCode 只认 code∈{0,1}
         if not _check_code_ok(res, allow_200=False):
-            raise RuntimeError(f"{course_prefix} 完成失败，已停止学习：{res}")
+            self.log.error(f"{course_prefix} 完成失败，本次跳过并继续后续课程：{res}")
+            return False
 
         if query.get("csComm", [None])[0] == "true" and query.get("weiban", [None])[0] == "weiban":
             for label, load in (
@@ -1870,7 +1990,7 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
             ):
                 response = load()
                 if not _check_code_ok(response):
-                    raise RuntimeError(f"完课评价页{label}读取失败，已停止学习")
+                    raise RuntimeError(f"完课评价页{label}读取失败，跳过本门课程")
         self.log.success(f"{course_prefix} 完成")
         return True
 
@@ -1968,7 +2088,11 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
             question_random_upper = 3
         self.exam_mode = exam_mode
 
-        answers_json = self._load_answers_json()
+        try:
+            answers_json = self._load_answers_json()
+        except AnswerBankError as e:
+            self.log.error(f"{e}，已跳过考试")
+            return
 
         if only_project is not None:
             projects = [only_project]
@@ -2140,7 +2264,7 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
                             session=self.api.session,
                             ai_config=self.ai_config or {},
                             question=q_dict,
-                            base_path=base_path,
+                            base_path=BASE_DIR,
                             data_dir=self.data_dir,
                             log=self.log,
                             warned_key_state=warned_state,
@@ -2452,93 +2576,34 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
             video_urls.extend(urljoin(html_url, src) for src in re.findall(
                 r'''["']([^"'\s<>]+\.(?:mp4|m3u8)(?:\?[^"'\s<>]*)?)["']''', script
             ))
-            # 备用 CDN 不重复计时，多段视频累计时长。
-            video_sources = {}
+            # 同一文件有多个 CDN 镜像（如 BaseCDN/WangSuCDN）：按文件名分组，
+            # 每个文件只计一次时长；镜像按出现顺序尝试，前一个取不到
+            # （如备用 CDN 证书过期）换下一个，多段视频累计时长。
+            video_sources: dict[str, list[str]] = {}
             for video_url in video_urls:
                 name = urlparse(video_url).path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-                video_sources.setdefault(name, video_url)
+                mirrors = video_sources.setdefault(name, [])
+                if video_url not in mirrors:
+                    mirrors.append(video_url)
             durations = []
-            for video_url in video_sources.values():
+            for mirrors in video_sources.values():
                 result["has_video"] = True
                 video_duration = 0.0
-                try:
-                    if urlparse(video_url).path.endswith(".m3u8"):
-                        # m3u8：累加 EXTINF 时长
-                        playlist = self.api.session.get(video_url, timeout=10)
-                        if playlist.status_code == 200:
-                            segments = re.findall(
-                                r"#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)",
-                                playlist.text,
-                            )
-                            if not segments:
-                                variant = re.search(
-                                    r"#EXT-X-STREAM-INF:[^\n]*\n\s*(\S+)",
-                                    playlist.text,
-                                )
-                                if variant:
-                                    playlist = self.api.session.get(
-                                        urljoin(video_url, variant.group(1)),
-                                        timeout=10,
-                                    )
-                                    if playlist.status_code == 200:
-                                        segments = re.findall(
-                                            r"#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)",
-                                            playlist.text,
-                                        )
-                            video_duration = sum(float(s) for s in segments)
-                    else:
-                        # moov 可能在 mdat 后，按 box 长度跳转定位。
-                        offset = 0
-                        movie_end = None
-                        full_content = None
-                        for _ in range(128):
-                            if full_content is None:
-                                metadata = self.api.session.get(
-                                    video_url,
-                                    headers={"Range": f"bytes={offset}-{offset + 63}"},
-                                    timeout=10,
-                                )
-                                if metadata.status_code not in (200, 206):
-                                    break
-                                if metadata.status_code == 200:
-                                    full_content = metadata.content
-                                buf = metadata.content if full_content is None else full_content[offset:offset + 64]
-                            else:
-                                buf = full_content[offset:offset + 64]
-                            if len(buf) < 8:
-                                break
-                            size = int.from_bytes(buf[:4], "big")
-                            kind = buf[4:8]
-                            header = 16 if size == 1 else 8
-                            if size == 1:
-                                size = int.from_bytes(buf[8:16], "big")
-                            if size < header:
-                                break
-                            if kind == b"moov":
-                                movie_end = offset + size
-                                offset += header
-                                continue
-                            if kind == b"mvhd" and movie_end is not None:
-                                version = buf[header]
-                                scale_pos = header + (20 if version == 1 else 12)
-                                duration_pos = scale_pos + 4
-                                duration_size = 8 if version == 1 else 4
-                                if version not in (0, 1) or len(buf) < duration_pos + duration_size:
-                                    break
-                                timescale = int.from_bytes(buf[scale_pos:duration_pos], "big")
-                                duration = int.from_bytes(buf[duration_pos:duration_pos + duration_size], "big")
-                                if timescale:
-                                    video_duration = duration / timescale
-                                break
-                            offset += size
-                            if movie_end is not None and offset >= movie_end:
-                                break
-                except OSError:
-                    pass
+                for mirror_url in mirrors:
+                    video_duration = _fetch_video_duration(self.api.session, mirror_url)
+                    if video_duration > 0:
+                        break
                 durations.append(video_duration)
             if durations:
-                if not all(durations) and self.video_speed > 0:
-                    raise RuntimeError("视频时长获取失败")
+                if not all(durations):
+                    self.log.warning(
+                        "视频课程，视频时长获取失败（所有 CDN 镜像均不可用）"
+                        + (
+                            "，跳过本门课程"
+                            if self.video_speed > 0
+                            else "，本次不按视频时长等待"
+                        )
+                    )
                 result["video_duration"] = sum(durations) if all(durations) else 0.0
                 self.log.info(
                     "视频课程，视频时长 "
@@ -2562,7 +2627,7 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
         except (PermissionError, RuntimeError):
             raise
         except Exception as e:  # 解析边界转为明确失败，不能降级为无轨迹完课
-            raise RuntimeError(f"课程资源或脚本解析失败（{type(e).__name__}），已停止学习") from e
+            raise RuntimeError(f"课程资源或脚本解析失败（{type(e).__name__}），跳过本门课程") from e
         return result
 
     # ---- apinext / answer helpers -------------------------------------------
@@ -2611,7 +2676,7 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
                 unique_no=unique_no,
             )
             if not resp.get("success"):
-                raise RuntimeError(f"apinext [{label}] 返回失败，已停止学习")
+                raise RuntimeError(f"apinext [{label}] 返回失败，跳过本门课程")
             self.log.info(f"apinext [{label}] finish={finish} 已发送")
 
         if finish == 2:
@@ -2670,7 +2735,7 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
         title = clean_text(question.get("title", ""))
         option_list = question.get("optionList", [])
         if not option_list:
-            raise RuntimeError("课程题目缺少选项，已停止学习")
+            raise RuntimeError("课程题目缺少选项，跳过本门课程")
 
         answer_ids = []
         if title in answers_json:
@@ -2685,32 +2750,32 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
 
         res = save_func(course_id, question["id"], json.dumps(answer_ids), source)
         if not _check_code_ok(res):
-            raise RuntimeError("课程答案保存失败，已停止学习")
+            raise RuntimeError("课程答案保存失败，跳过本门课程")
         data = res.get("data")
         if isinstance(data, list):
             return matched
         if not isinstance(data, dict):
-            raise TypeError("课程答案响应格式异常，已停止学习")
+            raise TypeError("课程答案响应格式异常，跳过本门课程")
         if data.get("isRight") in (1, "1"):
             return matched
 
         # 题库错答也复用本次反馈，不再额外试答或遍历选项。
         answer_label = data.get("answerLabel", "")
         if not answer_label:
-            raise RuntimeError("课后题未通过且缺少反馈答案，已停止学习")
+            raise RuntimeError("课后题未通过且缺少反馈答案，跳过本门课程")
         if not isinstance(answer_label, str):
-            raise TypeError("课后题反馈答案格式异常，已停止学习")
+            raise TypeError("课后题反馈答案格式异常，跳过本门课程")
         correct_letters = {ch for ch in answer_label.replace("-", "") if ch.isalpha()}
         if not correct_letters:
-            raise RuntimeError("课后题反馈答案格式异常，已停止学习")
+            raise RuntimeError("课后题反馈答案格式异常，跳过本门课程")
         letter_to_opt = {chr(65 + idx): opt for idx, opt in enumerate(option_list)}
         if not correct_letters.issubset(letter_to_opt):
-            raise RuntimeError("课后题反馈无法匹配选项，已停止学习")
+            raise RuntimeError("课后题反馈无法匹配选项，跳过本门课程")
         answer_ids = [opt["id"] for letter, opt in letter_to_opt.items() if letter in correct_letters]
         corrected = save_func(course_id, question["id"], json.dumps(answer_ids), source)
         corrected_data = corrected.get("data")
         if not _check_code_ok(corrected) or not isinstance(corrected_data, dict) or corrected_data.get("isRight") not in (1, "1"):
-            raise RuntimeError("课后题修正后仍未通过，已停止学习")
+            raise RuntimeError("课后题修正后仍未通过，跳过本门课程")
         return False
 
     def record_answer(
@@ -2755,7 +2820,7 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
             session=self.api.session,
             ai_config=self.ai_config,
             question=question,
-            base_path=base_path,
+            base_path=BASE_DIR,
             data_dir=self.data_dir,
             log=self.log,
             warned_key_state=warned_state,
@@ -2821,55 +2886,88 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
             for entry in merged.values()
         }
 
+    def _write_answer_bank(self, text: str) -> None:
+        """把题库写到可写目录，写入失败记录日志后返回。"""
+        try:
+            os.makedirs(ANSWER_DIR, exist_ok=True)
+            with open(ANSWER_PATH, "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError as e:
+            self.log.error(f"题库写入失败（{ANSWER_PATH}）：{e}")
+
+    def _fallback_local_bank(self) -> dict | None:
+        """按 打包内置 > answer/ > 根目录 读取原始题库，全部不可用返回 None
+
+        读到后写入可写目录。
+        """
+        for path in (BUNDLE_ANSWER_PATH, ANSWER_PATH, ROOT_ANSWER_PATH):
+            try:
+                text = read_text_with_retry(path)
+                data = json.loads(text)
+            except Exception as e:  # noqa: BLE001 -- 换下一个来源
+                self.log.debug(f"本地题库不可用（{path}）：{e}")
+                continue
+            if self._is_valid_answers(data):
+                self._write_answer_bank(text)
+                return data
+            self.log.warning(f"本地题库格式无效（{path}），继续尝试其他来源")
+        return None
+
     def sync_answers(self) -> None:
         """同步答案
         :return: 无返回值
         """
-        os.makedirs(answer_dir, exist_ok=True)
+        try:
+            os.makedirs(ANSWER_DIR, exist_ok=True)
+        except OSError as e:
+            self.log.error(f"题库目录不可用（{ANSWER_DIR}）：{e}，跳过题库同步")
+            return
+
         # 按优先级查找已有题库: 根目录 > answer/ > 打包内置
         existing_path: str | None = None
-        for p in [root_answer_path, answer_path, bundle_answer_path]:
+        for p in (ROOT_ANSWER_PATH, ANSWER_PATH, BUNDLE_ANSWER_PATH):
             if os.path.exists(p):
                 existing_path = p
                 break
         need_download = existing_path is None
 
         answers_json: dict | None = None
-        if not need_download:
-            assert existing_path is not None
+        if existing_path is not None:
             try:
-                with open(existing_path, encoding="utf-8") as f:
-                    answers_json = json.load(f)
+                answers_json = json.loads(read_text_with_retry(existing_path))
+            except Exception:  # noqa: BLE001 -- 读不到或格式错误都转去下载
+                need_download = True
+            else:
                 if not self._is_valid_answers(answers_json):
                     need_download = True
-            except (json.JSONDecodeError, OSError):
-                need_download = True
+                    answers_json = None
 
         if need_download:
-            # 与模板下载同构：远程 jsDelivr 失败后回退打包内置/本地文件兜底
+            # 远程下载失败时读取本地题库
             self.log.info("题库不存在或格式错误，正在下载...")
+            remote: str | None = None
             try:
                 remote = self.api.download_answer()
                 self.log.success("题库已从远程下载")
             except Exception as e:  # noqa: BLE001 -- 网络失败不应中断整个账号流程
-                self.log.warning(f"题库下载失败：{e}，回退本地内置题库")
-                remote = read_first_existing(
-                    [bundle_answer_path, answer_path, root_answer_path]
-                )
-                if remote is None:
+                self.log.warning(f"题库下载失败：{e}，回退本地题库")
+            if remote is not None:
+                try:
+                    answers_json = json.loads(remote)
+                except ValueError as e:
+                    self.log.error(f"下载的题库格式无效：{e}")
+                    answers_json = None
+                else:
+                    if self._is_valid_answers(answers_json):
+                        self._write_answer_bank(remote)
+                    else:
+                        self.log.error("下载的题库格式无效，应为非空 JSON 对象")
+                        answers_json = None
+            if answers_json is None:
+                answers_json = self._fallback_local_bank()
+                if answers_json is None:
                     self.log.warning("本地无可用题库，本次跳过题库同步")
                     return
-            with open(answer_path, "w", encoding="utf-8") as f:
-                f.write(remote)
-            try:
-                with open(answer_path, encoding="utf-8") as f:
-                    answers_json = json.load(f)
-            except (json.JSONDecodeError, OSError) as e:
-                self.log.error(f"读取题库失败：{e}")
-                return
-            if not self._is_valid_answers(answers_json):
-                self.log.error("下载的题库格式无效，应为非空 JSON 对象")
-                return
 
         if answers_json is None:
             self.log.error("题库加载失败")
@@ -2978,12 +3076,17 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
         # 与 _load_answers_json 的加载优先级保持一致，避免同步结果不被加载
         write_path = (
             existing_path
-            if existing_path is not None and existing_path != bundle_answer_path
-            else answer_path
+            if existing_path is not None and existing_path != BUNDLE_ANSWER_PATH
+            else ANSWER_PATH
         )
-        os.makedirs(os.path.dirname(write_path), exist_ok=True)
-        with open(write_path, "w", encoding="utf-8") as f:
-            f.write(
-                json.dumps(answers_json, indent=2, ensure_ascii=False, sort_keys=True)
-            )
-            f.write("\n")
+        try:
+            os.makedirs(os.path.dirname(write_path), exist_ok=True)
+            with open(write_path, "w", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        answers_json, indent=2, ensure_ascii=False, sort_keys=True
+                    )
+                )
+                f.write("\n")
+        except OSError as e:
+            self.log.error(f"题库保存失败（{write_path}）：{e}，本次结果未落盘")

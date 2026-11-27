@@ -71,12 +71,6 @@ _bypass_proxy_for_local_hosts()
 import requests
 from loguru import logger
 
-from ai_client import parse_bool
-from captcha import check_browser_health, is_non_interactive
-from client import WeBanClient, read_first_existing
-from exam_ui import run_demo_exam_ui
-from knowledge import parse_knowledge_paths
-
 # ── 命令行参数与环境变量（优先级：CLI > 环境变量 > 配置文件）────────
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -357,12 +351,30 @@ def merge_ai_config(opts: argparse.Namespace, ai: dict) -> dict:
 
 # 命令行 > 环境变量 > 自动检测（配置文件在 load_config 后再合并）
 _OPTS, _ = _parse_args()
+# --data-dir 必须在导入 client/utils 之前写回环境变量：题库与日志目录
+# 由 utils 在导入时解析，只认 WB_DATA_DIR
 if _OPTS.data_dir:
-    _data_dir = _OPTS.data_dir
+    os.environ["WB_DATA_DIR"] = os.path.abspath(_OPTS.data_dir)
 elif os.environ.get("WB_DATA_DIR"):
-    _data_dir = os.environ["WB_DATA_DIR"]
-else:
-    _data_dir = None
+    os.environ["WB_DATA_DIR"] = os.path.abspath(os.environ["WB_DATA_DIR"])
+
+from weban.ai_client import parse_bool
+from weban.api import AccountBlockedError
+from weban.captcha import check_browser_health, is_non_interactive
+from weban.client import WeBanClient, read_first_existing
+from weban.exam_ui import run_demo_exam_ui
+from weban.knowledge import parse_knowledge_paths
+from weban.utils import (
+    APP_DIR,
+    BASE_DIR,
+    CONFIG_EXAMPLE_CANDIDATES,
+    CONFIG_PATH,
+    DATA_DIR,
+    LOGS_DIR,
+    USED_FALLBACK,
+    Stream,
+    ask,
+)
 
 
 def _detect_non_interactive() -> bool:
@@ -391,7 +403,8 @@ def _resolve_version() -> str:
         bundle = getattr(sys, "_MEIPASS", None)
         if bundle:
             candidates.append(os.path.join(bundle, "pyproject.toml"))
-    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pyproject.toml"))
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(os.path.dirname(package_dir), "pyproject.toml"))
 
     for path in candidates:
         try:
@@ -412,30 +425,10 @@ def _resolve_version() -> str:
 
 VERSION = f"v{_resolve_version()}"
 
-if getattr(sys, "frozen", False):
-    base_path = os.path.dirname(os.path.abspath(sys.executable))
-    bundle_path = sys._MEIPASS  # type: ignore[attr-defined]
-else:
-    base_path = os.path.dirname(os.path.abspath(__file__))
-    bundle_path = base_path
-
 _cli_config = _OPTS.config or os.environ.get("WB_CONFIG", "").strip() or None
-if _cli_config:
-    config_path = _cli_config
-    logs_dir = os.path.join(_data_dir or base_path, "logs")
-elif _data_dir:
-    # Docker/数据目录模式：config/logs/answer 全部放数据目录（可挂载持久化）
-    config_path = os.path.join(_data_dir, "config.toml")
-    logs_dir = os.path.join(_data_dir, "logs")
-else:
-    config_path = os.path.join(base_path, "config.toml")
-    logs_dir = os.path.join(base_path, "logs")
-# 模板可能位于: 打包资源目录(_MEIPASS, onefile 解压) / exe 旁 / 源码目录
-# frozen 时 base_path 是 exe 目录而模板在 bundle 里，必须 bundle 优先
-config_example_candidates = [
-    os.path.join(bundle_path, "config.example.toml"),
-    os.path.join(base_path, "config.example.toml"),
-]
+config_path = _cli_config or CONFIG_PATH
+logs_dir = LOGS_DIR
+config_example_candidates = list(CONFIG_EXAMPLE_CANDIDATES)
 
 # 本次进程启动时间戳，用于日志文件名区分每次运行（如 20260810-132642）
 run_start_ts = time.strftime("%Y%m%d-%H%M%S")
@@ -457,10 +450,13 @@ def _log_format_message(record) -> str:
     # 必须显式加 \n，否则终端所有日志挤在一行
     return log_format + "\n"  # loguru 会基于修改后的 record 替换占位符
 
-# 远程模板下载地址（jsDelivr CDN 稳定；gh-proxy 免费公共代理会限流 403，
-# github 官方 raw 域名在国内不稳定，均不用）
-CONFIG_EXAMPLE_URL = (
-    "https://cdn.jsdelivr.net/gh/NoobCock/WeBan@main/config.example.toml"
+# 远程模板下载地址：jsDelivr 与 GitHub 代理依次尝试。gh-proxy 免费
+# 公共代理会限流 403，只在前面几个源都失败时才走到。
+CONFIG_EXAMPLE_URLS = (
+    "https://cdn.jsdelivr.net/gh/NoobCock/WeBan@main/config.example.toml",
+    "https://fastly.jsdelivr.net/gh/NoobCock/WeBan@main/config.example.toml",
+    "https://gh-proxy.com/https://raw.githubusercontent.com/NoobCock/WeBan/main/config.example.toml",
+    "https://ghfast.top/https://raw.githubusercontent.com/NoobCock/WeBan/main/config.example.toml",
 )
 
 # ── 日志 ──
@@ -475,7 +471,7 @@ log_format = (
 # 终端输出转义为单行并截断超长消息（DEBUG 模式请求/响应详情可能刷屏）；
 # 标记 file_only=True 的日志（如已流式展示过的思考摘要）仅写入日志文件
 logger.add(
-    sink=sys.stdout,
+    sink=Stream(),
     colorize=True,
     format=_log_format_message,
     filter=lambda record: not record["extra"].get("file_only"),
@@ -505,40 +501,76 @@ def _parse_version(text: str) -> tuple[int, ...]:
     return tuple(int(part) for part in re.findall(r"\d+", text or ""))
 
 
+def _fetch_latest_release() -> tuple[str, str] | None:
+    """获取最新 Release 的 (tag, 发布页 URL)，全部源失败返回 None。
+
+    直连 api.github.com 在国内经常超时：gh-proxy 支持代理 API，ghfast
+    不代理 API，改用 releases/latest 的 302 跳转取 tag。
+    """
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"WeBan/{VERSION}",
+    }
+    for name, url in (
+        ("GitHub", api_url),
+        ("gh-proxy.com", f"https://gh-proxy.com/{api_url}"),
+    ):
+        try:
+            resp = requests.get(url, headers=headers, timeout=UPDATE_CHECK_TIMEOUT)
+        except requests.RequestException as e:
+            logger.debug(f"更新检查：{name} 失败（{e}）")
+            continue
+        if resp.status_code != 200:
+            logger.debug(f"更新检查：{name} 返回 HTTP {resp.status_code}")
+            continue
+        try:
+            data = resp.json()
+        except ValueError as e:
+            logger.debug(f"更新检查：{name} 响应解析失败（{e}）")
+            continue
+        tag = data.get("tag_name") if isinstance(data, dict) else ""
+        if not tag:
+            logger.debug(f"更新检查：{name} 响应缺少 tag_name")
+            continue
+        return tag, data.get("html_url") or (
+            f"https://github.com/{GITHUB_REPO}/releases/tag/{tag}"
+        )
+
+    page_url = f"https://ghfast.top/https://github.com/{GITHUB_REPO}/releases/latest"
+    try:
+        resp = requests.get(
+            page_url,
+            headers={"User-Agent": f"WeBan/{VERSION}"},
+            timeout=UPDATE_CHECK_TIMEOUT,
+            allow_redirects=False,
+        )
+        match = re.search(
+            r"/releases/tag/([^/?#]+)", resp.headers.get("Location", "")
+        )
+        if match:
+            tag = match.group(1)
+            return tag, f"https://github.com/{GITHUB_REPO}/releases/tag/{tag}"
+        logger.debug(
+            f"更新检查：ghfast.top 返回 HTTP {resp.status_code}，未跳转到标签页"
+        )
+    except requests.RequestException as e:
+        logger.debug(f"更新检查：ghfast.top 失败（{e}）")
+    return None
+
+
 def _run_update_check() -> None:
     """执行一次 GitHub 最新 Release 检查并输出结果（同步实现）。
 
     有新版 → WARNING 提示下载地址；无新版 → DEBUG；
-    网络/HTTP/解析失败 → WARNING 说明原因并跳过（不重试、不阻塞）。
+    GitHub 与镜像全部失败 → WARNING 说明并跳过（不重试、不阻塞）。
     """
-    try:
-        resp = requests.get(
-            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": f"WeBan/{VERSION}",
-            },
-            timeout=UPDATE_CHECK_TIMEOUT,
-        )
-    except requests.RequestException as e:
-        logger.warning(f"检查更新失败（网络异常）：{e}，已跳过")
+    release = _fetch_latest_release()
+    if release is None:
+        logger.warning("检查更新失败（GitHub 及镜像均不可用），已跳过")
         return
-    if resp.status_code != 200:
-        logger.warning(f"检查更新失败：GitHub API 返回 {resp.status_code}，已跳过")
-        return
-    try:
-        data = resp.json()
-        if not isinstance(data, dict):
-            logger.warning("检查更新失败：响应格式异常，已跳过")
-            return
-    except ValueError:
-        logger.warning("检查更新失败：响应解析异常，已跳过")
-        return
-    latest = data.get("tag_name") or ""
+    latest, latest_url = release
     if _parse_version(latest) > _parse_version(VERSION):
-        latest_url = data.get("html_url") or (
-            f"https://github.com/{GITHUB_REPO}/releases/latest"
-        )
         logger.warning(
             f"发现新版本 {latest}（当前 {VERSION}），请前往 {latest_url} 下载更新"
         )
@@ -568,7 +600,7 @@ def open_editor(path: str):
         logger.warning("无法打开编辑器，请手动编辑上述文件")
     try:
         print("编辑完成后按回车键继续...", flush=True)
-        input()
+        ask()
     except EOFError:  # stdin 关闭（如管道执行）时直接结束
         pass
 
@@ -591,9 +623,9 @@ def prompt_account_interactive() -> dict | None:
     """交互式提示输入学校/用户名/密码，返回账号 dict；输入被中断或未填完整返回 None"""
     print("\n请输入账号信息：")
     try:
-        tenant_name = input("  学校全称（如：北京交通大学）: ").strip()
-        username = input("  用户名（学号）: ").strip()
-        password = input("  密码（默认同用户名）: ").strip()
+        tenant_name = ask("  学校全称（如：北京交通大学）: ").strip()
+        username = ask("  用户名（学号）: ").strip()
+        password = ask("  密码（默认同用户名）: ").strip()
     except (EOFError, KeyboardInterrupt):
         logger.warning("输入被中断")
         return None
@@ -665,21 +697,29 @@ def load_config() -> dict:
             return {"settings": {}, "ai": {}, "account": []}
         logger.info("config.toml 不存在，正在下载远程模板...")
         downloaded = False
-        try:
-            resp = requests.get(CONFIG_EXAMPLE_URL, timeout=30)
-            resp.raise_for_status()
-            os.makedirs(os.path.dirname(config_path), exist_ok=True)
-            with open(config_path, "w", encoding="utf-8") as f:
-                f.write(resp.text)
-            logger.success(f"远程模板已下载到 {config_path}")
-            downloaded = True
-        except OSError as e:
-            logger.warning(f"下载远程模板失败 ({CONFIG_EXAMPLE_URL}): {e}")
+        for url in CONFIG_EXAMPLE_URLS:
+            try:
+                resp = requests.get(url, timeout=30)
+                resp.raise_for_status()
+                try:
+                    tomllib.loads(resp.text)
+                except ValueError as e:
+                    logger.debug(f"远程模板内容无效 ({url}): {e}")
+                    continue
+                os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
+                with open(config_path, "w", encoding="utf-8") as f:
+                    f.write(resp.text)
+                logger.success(f"远程模板已下载到 {config_path}")
+                downloaded = True
+                break
+            except OSError as e:
+                logger.debug(f"下载远程模板失败 ({url}): {e}")
 
         if not downloaded:
+            logger.warning("下载远程模板失败（所有源均不可用），尝试本地模板")
             local_template = read_first_existing(config_example_candidates)
             if local_template is not None:
-                os.makedirs(os.path.dirname(config_path), exist_ok=True)
+                os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
                 with open(config_path, "w", encoding="utf-8") as f:
                     f.write(local_template)
                 logger.success(f"已从本地模板创建 {config_path}")
@@ -779,7 +819,7 @@ def run_account(
         cli_or_env(
             "video_speed",
             _OPTS.video_speed,
-            get_setting("video_speed", 1),
+            get_setting("video_speed", 2),
         )
     )
     exam_question_time = cli_or_env(
@@ -869,7 +909,7 @@ def run_account(
                 ai_config=ai_config,
                 video_speed=video_speed,
                 jupiter_fallback=jupiter_fallback,
-                data_dir=_data_dir,
+                data_dir=DATA_DIR or None,
                 exam_ui=exam_ui,
                 exam_ui_port=exam_ui_port,
             )
@@ -888,7 +928,7 @@ def run_account(
                 ai_config=ai_config,
                 video_speed=video_speed,
                 jupiter_fallback=jupiter_fallback,
-                data_dir=_data_dir,
+                data_dir=DATA_DIR or None,
                 exam_ui=exam_ui,
                 exam_ui_port=exam_ui_port,
             )
@@ -929,8 +969,11 @@ def run_account(
         log.success("执行完成")
         return True
 
+    except AccountBlockedError as e:
+        log.error(f"账号受限: {e}")
+        return False
     except PermissionError as e:
-        log.error(f"权限错误: {e}")
+        log.error(f"文件访问被拒绝: {e}")
         return False
     except RuntimeError as e:
         log.error(f"运行时错误: {e}")
@@ -948,9 +991,11 @@ def run_account(
 
 # ── 入口 ────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main() -> None:
     try:
         logger.info(f"程序启动，当前版本：{VERSION}")
+        if USED_FALLBACK:
+            logger.warning(f"程序目录不可写，配置、题库和日志改存：{APP_DIR}")
         if _OPTS.exam_ui_demo:
             demo_ai_cfg: dict = {}
             if os.path.exists(config_path):
@@ -977,8 +1022,8 @@ if __name__ == "__main__":
             )
             outcome = run_demo_exam_ui(
                 ai_config=demo_ai_cfg,
-                base_path=base_path,
-                data_dir=_data_dir,
+                base_path=BASE_DIR,
+                data_dir=DATA_DIR or (APP_DIR if USED_FALLBACK else None),
                 port=demo_port,
                 open_browser=not NON_INTERACTIVE,
                 use_mock=bool(_OPTS.mock),
@@ -1110,7 +1155,7 @@ if __name__ == "__main__":
                 or acct.get("tenant_name", "")
             )
             choice = (
-                input(f"当前账号：{acct_name}，是否更换账号？(y/N，默认N): ")
+                ask(f"当前账号：{acct_name}，是否更换账号？(y/N，默认N): ")
                 .strip()
                 .lower()
             )
@@ -1190,7 +1235,7 @@ if __name__ == "__main__":
 
         if len(accounts) > 1 and not NON_INTERACTIVE:
             choice = (
-                input(f"检测到 {len(accounts)} 个账号，是否同时运行？(Y/n，默认Y): ")
+                ask(f"检测到 {len(accounts)} 个账号，是否同时运行？(Y/n，默认Y): ")
                 .strip()
                 .lower()
             )
@@ -1250,6 +1295,10 @@ if __name__ == "__main__":
 
     if not NON_INTERACTIVE:
         try:
-            input("按回车键退出")
+            ask("按回车键退出")
         except EOFError:
             pass
+
+
+if __name__ == "__main__":
+    main()

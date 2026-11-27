@@ -23,15 +23,15 @@ from typing import Any
 import requests
 from loguru import logger
 
-from ai_client import (
+from weban.ai_client import (
     AIMetrics,
     AISolveResult,
     extract_endpoint_host,
     parse_bool,
     solve_question_with_ai,
 )
-from exam_ui_page import EXAM_UI_HTML
-from knowledge import RetrievalResult
+from weban.exam_ui_page import EXAM_UI_HTML
+from weban.knowledge import RetrievalResult
 
 AISolverFn = Callable[
     [

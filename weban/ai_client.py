@@ -24,8 +24,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
-from captcha import is_non_interactive
-from knowledge import KnowledgeBase, RetrievalResult, load_knowledge_base
+from weban.captcha import is_non_interactive
+from weban.knowledge import KnowledgeBase, RetrievalResult, load_knowledge_base
 
 _STREAM_STDOUT_LOCK = threading.Lock()
 
